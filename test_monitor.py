@@ -510,21 +510,22 @@ class TestMaybeSendDigest:
     def test_already_sent_today_skips(self, tmp_path, monkeypatch):
         monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
         with patch("monitor.send_telegram") as mock_send:
-            with freeze_time("2026-05-17 10:00:00"):
+            with freeze_time("2026-05-17 12:00:00"):
                 monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-17"}, self.TOKEN, self.CHAT_ID)
         mock_send.assert_not_called()
 
-    def test_before_8am_skips(self, tmp_path, monkeypatch):
+    def test_before_8am_eastern_skips(self, tmp_path, monkeypatch):
+        """11:59 UTC = 07:59 AM EDT — should NOT fire despite being past 08:00 UTC."""
         monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
         with patch("monitor.send_telegram") as mock_send:
-            with freeze_time("2026-05-17 07:59:00"):
+            with freeze_time("2026-05-17 11:59:00"):
                 monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID)
         mock_send.assert_not_called()
 
     def test_sends_when_conditions_met(self, tmp_path, monkeypatch):
         monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
         with patch("monitor.send_telegram") as mock_send:
-            with freeze_time("2026-05-17 10:00:00"):
+            with freeze_time("2026-05-17 12:00:00"):
                 new_state = monitor.maybe_send_digest(
                     FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID
                 )
@@ -537,12 +538,31 @@ class TestMaybeSendDigest:
         base = datetime(2026, 5, 16, 12, 0, tzinfo=timezone.utc)
         write_uptime_log(log, "worker1", [True] * 5, base)
         with patch("monitor.send_telegram") as mock_send:
-            with freeze_time("2026-05-17 10:00:00"):
+            with freeze_time("2026-05-17 12:00:00"):
                 monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID)
         assert "worker1" in mock_send.call_args[0][0]
 
 
-# ── 9. Formatters ─────────────────────────────────────────────────────────────
+# ── 9. Process commands ───────────────────────────────────────────────────────
+
+class TestProcessCommandsHelp:
+    TOKEN, CHAT_ID = "tok", "123"
+
+    def test_help_lists_available_commands(self):
+        update = [{"update_id": 1, "message": {"chat": {"id": self.CHAT_ID}, "text": "/help"}}]
+        state = {"last_update_id": 0}
+        with patch("monitor.get_telegram_updates", return_value=update):
+            with patch("monitor.send_telegram") as mock_send:
+                monitor.process_commands(self.TOKEN, self.CHAT_ID, FAKE_WORKERS, state)
+        mock_send.assert_called_once()
+        response = mock_send.call_args[0][0]
+        assert "/status" in response
+        assert "/uptime" in response
+        assert "/history" in response
+        assert "/help" in response
+
+
+# ── 10. Formatters ────────────────────────────────────────────────────────────
 
 class TestFormatStatus:
     def test_online_worker_shows_green(self):

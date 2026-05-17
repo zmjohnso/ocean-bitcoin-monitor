@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -376,9 +377,10 @@ def maybe_send_digest(
     workers: list[dict], state: dict, token: str, chat_id: str
 ) -> dict:
     now = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
+    now_et = now.astimezone(ZoneInfo("America/New_York"))
+    today = now_et.strftime("%Y-%m-%d")
 
-    if now.hour < 8 or state.get("last_digest_date") == today:
+    if now_et.hour < 8 or state.get("last_digest_date") == today:
         return state
 
     new_state = dict(state)
@@ -473,6 +475,16 @@ def process_commands(
             send_telegram(format_uptime_report(stats, since, until), token, chat_id)
         elif text == "/history":
             send_telegram(format_history(get_offline_history(10)), token, chat_id)
+        elif text == "/help":
+            send_telegram(
+                "Available commands:\n"
+                "  /status — current online/offline state of all rigs\n"
+                "  /uptime — 30-day uptime report\n"
+                "  /history — last 10 offline events\n"
+                "  /help — show this message",
+                token,
+                chat_id,
+            )
 
     return new_state
 
