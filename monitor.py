@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / "state.json"
 UPTIME_LOG = BASE_DIR / "uptime_log.jsonl"
 LOG_FILE = BASE_DIR / "logs" / "monitor.log"
+LOG_FILE.parent.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
