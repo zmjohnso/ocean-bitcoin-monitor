@@ -16,7 +16,7 @@ Monitors Ocean.xyz mining rigs and sends Telegram alerts when a rig goes offline
 | Rig offline | No share submitted for >15 min |
 | Rig recovered | Rig comes back online after being marked offline |
 | Still offline | Follow-up at 2hr, 6hr, 24hr, 48hr marks |
-| Daily digest | Auto-summary every morning at 08:00 UTC |
+| Daily digest | Auto-summary every morning at 08:00 AM ET |
 
 ## Bot commands
 
@@ -27,6 +27,7 @@ Send these to your Telegram bot (response arrives within 5 minutes):
 | `/status` or `/ping` | Current rig status and hashrate |
 | `/uptime` | 30-day uptime % vs. 90% guarantee threshold |
 | `/history` | Last 10 offline events with timestamps and durations |
+| `/help` | List all available commands |
 
 ## Setup
 
