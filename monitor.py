@@ -150,6 +150,33 @@ def fetch_workers(wallet: str) -> list[dict] | None:
     return workers
 
 
+def parse_daily_earnings_sats(soup: BeautifulSoup) -> int | None:
+    """Extract 'Estimated Earnings Per Day' from a parsed stats page → satoshis."""
+    for container in soup.find_all("div", class_="blocks"):
+        label = container.find("div", class_="blocks-label")
+        if label and "Estimated Earnings Per Day" in label.get_text():
+            span = container.find("span", recursive=False)
+            if span:
+                try:
+                    btc = float(span.get_text(strip=True).split()[0])
+                    return round(btc * 100_000_000)
+                except (ValueError, IndexError):
+                    return None
+    return None
+
+
+def fetch_daily_earnings_sats(wallet: str) -> int | None:
+    """Fetch the stats page and return estimated daily earnings in satoshis."""
+    url = f"https://ocean.xyz/stats/{wallet}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("Failed to fetch earnings: %s", e)
+        return None
+    return parse_daily_earnings_sats(BeautifulSoup(resp.text, "html.parser"))
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -374,7 +401,7 @@ def format_history(events: list[dict]) -> str:
 
 
 def maybe_send_digest(
-    workers: list[dict], state: dict, token: str, chat_id: str
+    workers: list[dict], state: dict, token: str, chat_id: str, wallet: str | None = None
 ) -> dict:
     now = datetime.now(timezone.utc)
     now_et = now.astimezone(ZoneInfo("America/New_York"))
@@ -387,6 +414,12 @@ def maybe_send_digest(
     stats = compute_uptime(now - timedelta(hours=24), now)
 
     lines = [f"☀️ Daily Digest — {today}\n"]
+
+    if wallet:
+        sats = fetch_daily_earnings_sats(wallet)
+        if sats is not None:
+            lines.append(f"  Estimated daily earnings: {sats:,} sats\n")
+
     for worker in sorted(stats):
         s = stats[worker]
         total, online = s["total"], s["online"]
@@ -574,7 +607,7 @@ def main() -> None:
     state = process_commands(token, chat_id, workers, state)
     new_state = evaluate_and_alert(workers, state, token, chat_id, offline_threshold)
     new_state = check_outage_reminders(workers, new_state, token, chat_id)
-    new_state = maybe_send_digest(workers, new_state, token, chat_id)
+    new_state = maybe_send_digest(workers, new_state, token, chat_id, wallet=wallet)
     save_state(new_state)
     log.info("Run complete. State: %s", new_state)
 

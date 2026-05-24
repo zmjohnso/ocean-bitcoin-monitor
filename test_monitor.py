@@ -502,7 +502,40 @@ class TestCheckOutageReminders:
         mock_send.assert_not_called()
 
 
-# ── 8. Daily digest ───────────────────────────────────────────────────────────
+# ── 8. Daily earnings parser ─────────────────────────────────────────────────
+
+EARNINGS_HTML = """
+<html><body>
+<div class="blocks dashboard-container">
+  <div class="blocks-label">Estimated Earnings Per Day
+    <div class="tooltip tooltip-info">
+      <span class="tooltiptext">Estimated earnings per day tooltip</span>
+    </div>
+  </div>
+  <span>0.00050000 BTC</span>
+</div>
+</body></html>
+"""
+
+class TestParseDailyEarningsSats:
+    def test_extracts_sats_from_btc_value(self):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(EARNINGS_HTML, "html.parser")
+        assert monitor.parse_daily_earnings_sats(soup) == 50000
+
+    def test_missing_element_returns_none(self):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup("<html><body></body></html>", "html.parser")
+        assert monitor.parse_daily_earnings_sats(soup) is None
+
+    def test_zero_earnings_returns_zero(self):
+        from bs4 import BeautifulSoup
+        html = EARNINGS_HTML.replace("0.00050000 BTC", "0.00000000 BTC")
+        soup = BeautifulSoup(html, "html.parser")
+        assert monitor.parse_daily_earnings_sats(soup) == 0
+
+
+# ── 9. Daily digest ───────────────────────────────────────────────────────────
 
 class TestMaybeSendDigest:
     TOKEN, CHAT_ID = "tok", "123"
@@ -541,6 +574,30 @@ class TestMaybeSendDigest:
             with freeze_time("2026-05-17 12:00:00"):
                 monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID)
         assert "worker1" in mock_send.call_args[0][0]
+
+    def test_digest_includes_earnings_when_wallet_provided(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
+        with patch("monitor.fetch_daily_earnings_sats", return_value=50000) as mock_fetch:
+            with patch("monitor.send_telegram") as mock_send:
+                with freeze_time("2026-05-17 12:00:00"):
+                    monitor.maybe_send_digest(
+                        FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
+                        self.TOKEN, self.CHAT_ID, wallet="bc1qtest"
+                    )
+        mock_fetch.assert_called_once_with("bc1qtest")
+        assert "50,000" in mock_send.call_args[0][0]
+        assert "sats" in mock_send.call_args[0][0]
+
+    def test_digest_omits_earnings_when_fetch_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
+        with patch("monitor.fetch_daily_earnings_sats", return_value=None):
+            with patch("monitor.send_telegram") as mock_send:
+                with freeze_time("2026-05-17 12:00:00"):
+                    monitor.maybe_send_digest(
+                        FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
+                        self.TOKEN, self.CHAT_ID, wallet="bc1qtest"
+                    )
+        assert "sats" not in mock_send.call_args[0][0]
 
 
 # ── 9. Process commands ───────────────────────────────────────────────────────
