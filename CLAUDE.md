@@ -41,9 +41,11 @@ Single-file application: all monitor logic lives in `monitor.py`, deployed as a 
 
 **`report.py`** is a standalone CLI tool that reads `uptime_log.jsonl` directly to compute SLA compliance (90% guarantee threshold).
 
+**Break-even pricing:** `fetch_network_stats()` pulls current difficulty and block height from blockchain.info (block reward is derived from height, so it self-corrects at the next halving); `expected_daily_btc()` converts a hashrate into expected BTC/day; `compute_breakeven()` combines that with `POWER_DRAW_WATTS`/`ELECTRICITY_RATE_PER_KWH` into a break-even BTC price. `fetch_btc_price()` (CoinGecko, no key) supplies the current price for comparison. The `/breakeven` Telegram command uses the live hashrate from that poll's `fetch_workers()` call; the daily digest uses a trailing 24h average via `compute_avg_hashrate()`, which reads the hashrate now logged in `uptime_log.jsonl`. Both are skipped (silently in the digest, with an explicit message for `/breakeven`) if `POWER_DRAW_WATTS`/`ELECTRICITY_RATE_PER_KWH` aren't set or a fetch fails.
+
 **Persistent files:**
 - `state.json` — current online/offline state per worker; includes outage timestamps and Telegram update cursor
-- `uptime_log.jsonl` — append-only audit log, one JSON record per worker per poll: `{"ts": "...", "worker": "...", "online": bool}`
+- `uptime_log.jsonl` — append-only audit log, one JSON record per worker per poll: `{"ts": "...", "worker": "...", "online": bool, "hashrate_3hr": float}`
 
 **HTML scraping details** (see `fetch_workers()` docstring): worker rows have class `table-row`; the Total aggregate row is excluded by checking whether the href contains a `.worker_id` suffix after the wallet address. Worker names are derived from the href suffix, not the link text.
 
@@ -57,3 +59,4 @@ Copy `.env.example` to `.env` and set:
 - `WALLET` — Ocean.xyz wallet address
 - `OFFLINE_THRESHOLD_MINUTES` (default: 15) — minutes since last share before marking offline
 - `HASHRATE_DROP_THRESHOLD` (default: 0.25) — currently read but not acted upon in alert logic
+- `POWER_DRAW_WATTS`, `ELECTRICITY_RATE_PER_KWH` — optional; enable the `/breakeven` command and the digest break-even line

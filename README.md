@@ -16,7 +16,7 @@ Monitors Ocean.xyz mining rigs and sends Telegram alerts when a rig goes offline
 | Rig offline | No share submitted for >15 min |
 | Rig recovered | Rig comes back online after being marked offline |
 | Still offline | Follow-up at 2hr, 6hr, 24hr, 48hr marks |
-| Daily digest | Auto-summary every morning at 08:00 AM ET |
+| Daily digest | Auto-summary every morning at 08:00 AM ET (includes a break-even line if configured) |
 
 ## Bot commands
 
@@ -27,6 +27,7 @@ Send these to your Telegram bot (response arrives within 5 minutes):
 | `/status` or `/ping` | Current rig status and hashrate |
 | `/uptime` | 30-day uptime % vs. 90% guarantee threshold |
 | `/history` | Last 10 offline events with timestamps and durations |
+| `/breakeven` | Live break-even BTC price vs. current market price (needs `POWER_DRAW_WATTS` + `ELECTRICITY_RATE_PER_KWH`) |
 | `/help` | List all available commands |
 
 ## Setup
@@ -104,6 +105,8 @@ Edit `.env` to tune:
 | Variable | Default | Meaning |
 |---|---|---|
 | `OFFLINE_THRESHOLD_MINUTES` | `15` | Alert if no share for this many minutes |
+| `POWER_DRAW_WATTS` | *(unset)* | Total power draw across your rigs, for `/breakeven` and the digest |
+| `ELECTRICITY_RATE_PER_KWH` | *(unset)* | Your electricity rate, for `/breakeven` and the digest |
 
 ## Development & testing
 

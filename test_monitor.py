@@ -93,6 +93,14 @@ def write_sequence(path: Path, worker: str, sequence: list[tuple]) -> None:
             f.write(json.dumps({"ts": ts, "worker": worker, "online": online}) + "\n")
 
 
+def write_hashrate_records(path: Path, records: list[tuple]) -> None:
+    """records: list of (datetime, worker, online_bool, hashrate_3hr)"""
+    with path.open("a") as f:
+        for dt, worker, online, hashrate in records:
+            ts = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            f.write(json.dumps({"ts": ts, "worker": worker, "online": online, "hashrate_3hr": hashrate}) + "\n")
+
+
 # ── 1. Parsers ────────────────────────────────────────────────────────────────
 
 class TestParseHashrate:
@@ -263,6 +271,17 @@ class TestLogUptime:
         by_name = {r["worker"]: r for r in records}
         assert by_name["worker1"]["online"] is True
         assert by_name["worker2"]["online"] is False
+
+    def test_hashrate_3hr_logged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
+        monitor.log_uptime(FAKE_WORKERS)
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "uptime_log.jsonl").read_text().strip().splitlines()
+        ]
+        by_name = {r["worker"]: r for r in records}
+        assert by_name["worker1"]["hashrate_3hr"] == 650.0
+        assert by_name["worker2"]["hashrate_3hr"] == 325.0
 
 
 class TestComputeUptime:
@@ -599,6 +618,44 @@ class TestMaybeSendDigest:
                     )
         assert "sats" not in mock_send.call_args[0][0]
 
+    NETWORK_STATS = {"difficulty": 100_000_000_000_000, "block_height": 963338, "block_reward": 3.125}
+
+    def test_digest_includes_breakeven_when_configured(self, tmp_path, monkeypatch):
+        log = tmp_path / "uptime_log.jsonl"
+        monkeypatch.setattr("monitor.UPTIME_LOG", log)
+        with freeze_time("2026-05-17 12:00:00"):
+            write_hashrate_records(log, [(datetime.now(timezone.utc), "w1", True, 600.0)])
+            with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+                with patch("monitor.fetch_btc_price", return_value=72500.0):
+                    with patch("monitor.send_telegram") as mock_send:
+                        monitor.maybe_send_digest(
+                            FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
+                            self.TOKEN, self.CHAT_ID,
+                            power_draw_watts=12300, rate_per_kwh=0.068,
+                        )
+        result = mock_send.call_args[0][0]
+        assert "⚖️" in result
+        assert "24h avg" in result
+
+    def test_digest_omits_breakeven_when_not_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
+        with patch("monitor.send_telegram") as mock_send:
+            with freeze_time("2026-05-17 12:00:00"):
+                monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID)
+        assert "⚖️" not in mock_send.call_args[0][0]
+
+    def test_digest_omits_breakeven_when_network_stats_fail(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
+        with patch("monitor.fetch_network_stats", return_value=None):
+            with patch("monitor.send_telegram") as mock_send:
+                with freeze_time("2026-05-17 12:00:00"):
+                    monitor.maybe_send_digest(
+                        FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
+                        self.TOKEN, self.CHAT_ID,
+                        power_draw_watts=12300, rate_per_kwh=0.068,
+                    )
+        assert "⚖️" not in mock_send.call_args[0][0]
+
 
 # ── 9. Process commands ───────────────────────────────────────────────────────
 
@@ -620,6 +677,57 @@ class TestProcessCommandsHelp:
 
 
 # ── 10. Formatters ────────────────────────────────────────────────────────────
+
+class TestProcessCommandsBreakeven:
+    TOKEN, CHAT_ID = "tok", "123"
+    NETWORK_STATS = {"difficulty": 100_000_000_000_000, "block_height": 963338, "block_reward": 3.125}
+
+    def _send_breakeven(self, state=None):
+        update = [{"update_id": 1, "message": {"chat": {"id": self.CHAT_ID}, "text": "/breakeven"}}]
+        state = state or {"last_update_id": 0}
+        with patch("monitor.get_telegram_updates", return_value=update):
+            with patch("monitor.send_telegram") as mock_send:
+                monitor.process_commands(
+                    self.TOKEN, self.CHAT_ID, FAKE_WORKERS, state,
+                    power_draw_watts=12300, rate_per_kwh=0.068,
+                )
+        return mock_send
+
+    def test_not_configured_when_no_electricity_config(self):
+        update = [{"update_id": 1, "message": {"chat": {"id": self.CHAT_ID}, "text": "/breakeven"}}]
+        with patch("monitor.get_telegram_updates", return_value=update):
+            with patch("monitor.send_telegram") as mock_send:
+                monitor.process_commands(self.TOKEN, self.CHAT_ID, FAKE_WORKERS, {"last_update_id": 0})
+        assert "not configured" in mock_send.call_args[0][0].lower()
+
+    def test_success_uses_summed_live_hashrate(self):
+        with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+            with patch("monitor.fetch_btc_price", return_value=72500.0):
+                mock_send = self._send_breakeven()
+        result = mock_send.call_args[0][0]
+        assert "975.0" in result  # 650.0 + 325.0 summed across both workers
+
+    def test_network_stats_failure_reports_unavailable(self):
+        with patch("monitor.fetch_network_stats", return_value=None):
+            with patch("monitor.fetch_btc_price", return_value=72500.0):
+                mock_send = self._send_breakeven()
+        assert "unavailable" in mock_send.call_args[0][0].lower()
+
+    def test_price_failure_still_shows_breakeven(self):
+        with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+            with patch("monitor.fetch_btc_price", return_value=None):
+                mock_send = self._send_breakeven()
+        result = mock_send.call_args[0][0]
+        assert "Break-even price" in result
+        assert "unavailable" in result.lower()
+
+    def test_help_lists_breakeven_command(self):
+        update = [{"update_id": 1, "message": {"chat": {"id": self.CHAT_ID}, "text": "/help"}}]
+        with patch("monitor.get_telegram_updates", return_value=update):
+            with patch("monitor.send_telegram") as mock_send:
+                monitor.process_commands(self.TOKEN, self.CHAT_ID, FAKE_WORKERS, {"last_update_id": 0})
+        assert "/breakeven" in mock_send.call_args[0][0]
+
 
 class TestFormatStatus:
     def test_online_worker_shows_green(self):
@@ -657,3 +765,171 @@ class TestFormatUptimeReport:
     def test_empty_stats_shows_no_data(self):
         result = monitor.format_uptime_report({}, self.SINCE, self.UNTIL)
         assert "No uptime data" in result
+
+
+# ── 11. Break-even calculations ───────────────────────────────────────────────
+
+class TestExpectedDailyBtc:
+    def test_known_values(self):
+        result = monitor.expected_daily_btc(
+            hashrate_ths=500, difficulty=100_000_000_000_000, block_reward=3.125
+        )
+        assert result == pytest.approx(0.000314321368932724, rel=1e-9)
+
+    def test_zero_hashrate_returns_zero(self):
+        result = monitor.expected_daily_btc(
+            hashrate_ths=0, difficulty=100_000_000_000_000, block_reward=3.125
+        )
+        assert result == 0.0
+
+    def test_scales_linearly_with_hashrate(self):
+        low = monitor.expected_daily_btc(hashrate_ths=100, difficulty=1e14, block_reward=3.125)
+        high = monitor.expected_daily_btc(hashrate_ths=200, difficulty=1e14, block_reward=3.125)
+        assert high == pytest.approx(low * 2, rel=1e-9)
+
+
+class TestFetchNetworkStats:
+    def _responses(self, difficulty_text, blockcount_text):
+        return [make_mock_response(difficulty_text), make_mock_response(blockcount_text)]
+
+    def test_success_returns_difficulty_height_and_reward(self):
+        with patch("monitor.requests.get", side_effect=self._responses("127479855693691.0", "963338")):
+            result = monitor.fetch_network_stats()
+        assert result == {
+            "difficulty": pytest.approx(127479855693691.0),
+            "block_height": 963338,
+            "block_reward": pytest.approx(3.125),
+        }
+
+    def test_reward_at_next_halving_boundary(self):
+        with patch("monitor.requests.get", side_effect=self._responses("1e14", "1050000")):
+            result = monitor.fetch_network_stats()
+        assert result["block_reward"] == pytest.approx(1.5625)
+
+    def test_network_error_returns_none(self):
+        import requests as req_lib
+        with patch("monitor.requests.get", side_effect=req_lib.ConnectionError("timeout")):
+            assert monitor.fetch_network_stats() is None
+
+    def test_unparseable_response_returns_none(self):
+        with patch("monitor.requests.get", side_effect=self._responses("not a number", "963338")):
+            assert monitor.fetch_network_stats() is None
+
+
+class TestFetchBtcPrice:
+    def _price_response(self, usd):
+        resp = make_mock_response()
+        resp.json.return_value = {"bitcoin": {"usd": usd}}
+        return resp
+
+    def test_success_returns_price(self):
+        with patch("monitor.requests.get", return_value=self._price_response(72500.5)):
+            assert monitor.fetch_btc_price() == 72500.5
+
+    def test_network_error_returns_none(self):
+        import requests as req_lib
+        with patch("monitor.requests.get", side_effect=req_lib.ConnectionError("timeout")):
+            assert monitor.fetch_btc_price() is None
+
+    def test_malformed_response_returns_none(self):
+        resp = make_mock_response()
+        resp.json.return_value = {"unexpected": "shape"}
+        with patch("monitor.requests.get", return_value=resp):
+            assert monitor.fetch_btc_price() is None
+
+
+class TestComputeBreakeven:
+    def test_known_values(self):
+        result = monitor.compute_breakeven(
+            hashrate_ths=650,
+            difficulty=100_000_000_000_000,
+            block_reward=3.125,
+            power_draw_watts=12300,
+            rate_per_kwh=0.068,
+        )
+        assert result["expected_daily_btc"] == pytest.approx(0.0004086177796125412)
+        assert result["daily_cost"] == pytest.approx(20.073600000000006)
+        assert result["breakeven_price"] == pytest.approx(49125.61567691489)
+
+    def test_zero_hashrate_breakeven_is_none(self):
+        result = monitor.compute_breakeven(
+            hashrate_ths=0,
+            difficulty=100_000_000_000_000,
+            block_reward=3.125,
+            power_draw_watts=12300,
+            rate_per_kwh=0.068,
+        )
+        assert result["expected_daily_btc"] == 0.0
+        assert result["breakeven_price"] is None
+
+
+class TestComputeAvgHashrate:
+    BASE = datetime(2026, 5, 17, 10, 0, tzinfo=timezone.utc)
+
+    def test_no_file_returns_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "missing.jsonl")
+        result = monitor.compute_avg_hashrate(self.BASE, self.BASE + timedelta(hours=1))
+        assert result == 0.0
+
+    def test_single_worker_constant_hashrate(self, tmp_path, monkeypatch):
+        log = tmp_path / "uptime_log.jsonl"
+        monkeypatch.setattr("monitor.UPTIME_LOG", log)
+        write_hashrate_records(log, [
+            (self.BASE, "w1", True, 600.0),
+            (self.BASE + timedelta(minutes=5), "w1", True, 600.0),
+            (self.BASE + timedelta(minutes=10), "w1", True, 600.0),
+        ])
+        result = monitor.compute_avg_hashrate(self.BASE - timedelta(hours=1), self.BASE + timedelta(hours=1))
+        assert result == pytest.approx(600.0)
+
+    def test_two_workers_summed_per_poll_then_averaged(self, tmp_path, monkeypatch):
+        log = tmp_path / "uptime_log.jsonl"
+        monkeypatch.setattr("monitor.UPTIME_LOG", log)
+        write_hashrate_records(log, [
+            (self.BASE, "w1", True, 600.0),
+            (self.BASE, "w2", True, 300.0),
+            (self.BASE + timedelta(minutes=5), "w1", True, 650.0),
+            (self.BASE + timedelta(minutes=5), "w2", True, 350.0),
+        ])
+        result = monitor.compute_avg_hashrate(self.BASE - timedelta(hours=1), self.BASE + timedelta(hours=1))
+        assert result == pytest.approx(950.0)
+
+    def test_excludes_records_outside_window(self, tmp_path, monkeypatch):
+        log = tmp_path / "uptime_log.jsonl"
+        monkeypatch.setattr("monitor.UPTIME_LOG", log)
+        write_hashrate_records(log, [(self.BASE, "w1", True, 600.0)])
+        since = self.BASE + timedelta(hours=3)
+        until = self.BASE + timedelta(hours=4)
+        assert monitor.compute_avg_hashrate(since, until) == 0.0
+
+
+class TestFormatBreakevenMessage:
+    BREAKEVEN = {"expected_daily_btc": 0.00040862, "daily_cost": 20.07, "breakeven_price": 49125.62}
+
+    def test_profitable_shows_checkmark_and_margin(self):
+        result = monitor.format_breakeven_message(self.BREAKEVEN, hashrate_ths=650, current_price=72500, label="Live")
+        assert "✅" in result
+        assert "49,125.62" in result
+        assert "72,500" in result
+
+    def test_unprofitable_shows_cross(self):
+        result = monitor.format_breakeven_message(self.BREAKEVEN, hashrate_ths=650, current_price=30000, label="Live")
+        assert "❌" in result
+
+    def test_label_appears(self):
+        result = monitor.format_breakeven_message(self.BREAKEVEN, hashrate_ths=650, current_price=72500, label="24h avg")
+        assert "24h avg" in result
+
+    def test_hashrate_appears(self):
+        result = monitor.format_breakeven_message(self.BREAKEVEN, hashrate_ths=650, current_price=72500, label="Live")
+        assert "650.0" in result
+
+    def test_price_unavailable_omits_margin_but_shows_breakeven(self):
+        result = monitor.format_breakeven_message(self.BREAKEVEN, hashrate_ths=650, current_price=None, label="Live")
+        assert "49,125.62" in result
+        assert "unavailable" in result.lower()
+
+    def test_zero_hashrate_breakeven_unavailable(self):
+        breakeven = {"expected_daily_btc": 0.0, "daily_cost": 20.07, "breakeven_price": None}
+        result = monitor.format_breakeven_message(breakeven, hashrate_ths=0, current_price=72500, label="Live")
+        assert "unavailable" in result.lower() or "no hashrate" in result.lower()

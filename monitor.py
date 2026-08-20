@@ -177,6 +177,95 @@ def fetch_daily_earnings_sats(wallet: str) -> int | None:
     return parse_daily_earnings_sats(BeautifulSoup(resp.text, "html.parser"))
 
 
+def expected_daily_btc(hashrate_ths: float, difficulty: float, block_reward: float) -> float:
+    """Expected BTC/day for a given hashrate at current network difficulty."""
+    hashrate_hs = hashrate_ths * 1e12
+    return hashrate_hs * 86400 * block_reward / (difficulty * 2**32)
+
+
+def fetch_network_stats() -> dict | None:
+    """Fetch current network difficulty and block height, derive block reward."""
+    try:
+        difficulty = float(requests.get(
+            "https://blockchain.info/q/getdifficulty", headers=HEADERS, timeout=10
+        ).text)
+        block_height = int(requests.get(
+            "https://blockchain.info/q/getblockcount", headers=HEADERS, timeout=10
+        ).text)
+    except requests.RequestException as e:
+        log.warning("Failed to fetch network stats: %s", e)
+        return None
+    except (ValueError, TypeError) as e:
+        log.warning("Could not parse network stats response: %s", e)
+        return None
+
+    block_reward = 50 / 2 ** (block_height // 210_000)
+    return {
+        "difficulty": difficulty,
+        "block_height": block_height,
+        "block_reward": block_reward,
+    }
+
+
+def fetch_btc_price() -> float | None:
+    """Fetch current BTC/USD price from CoinGecko."""
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return float(resp.json()["bitcoin"]["usd"])
+    except (requests.RequestException, KeyError, TypeError, ValueError) as e:
+        log.warning("Failed to fetch BTC price: %s", e)
+        return None
+
+
+def compute_breakeven(
+    hashrate_ths: float,
+    difficulty: float,
+    block_reward: float,
+    power_draw_watts: float,
+    rate_per_kwh: float,
+) -> dict:
+    """Daily expected BTC, daily electricity cost, and the BTC price needed to break even."""
+    daily_btc = expected_daily_btc(hashrate_ths, difficulty, block_reward)
+    daily_cost = power_draw_watts / 1000 * 24 * rate_per_kwh
+    breakeven_price = daily_cost / daily_btc if daily_btc > 0 else None
+    return {
+        "expected_daily_btc": daily_btc,
+        "daily_cost": daily_cost,
+        "breakeven_price": breakeven_price,
+    }
+
+
+def format_breakeven_message(
+    breakeven: dict, hashrate_ths: float, current_price: float | None, label: str
+) -> str:
+    lines = [f"⚖️ Break-even — {label}"]
+    lines.append(f"  Hashrate: {fmt_hashrate(hashrate_ths)}")
+
+    breakeven_price = breakeven["breakeven_price"]
+    if breakeven_price is None:
+        lines.append("  Break-even price: unavailable (no hashrate)")
+        return "\n".join(lines)
+
+    lines.append(f"  Break-even price: ${breakeven_price:,.2f}/BTC")
+    lines.append(f"  Daily electricity cost: ${breakeven['daily_cost']:,.2f}")
+
+    if current_price is None:
+        lines.append("  Current BTC price: unavailable")
+    else:
+        margin = current_price - breakeven_price
+        emoji = "✅" if margin >= 0 else "❌"
+        lines.append(f"  Current BTC price: ${current_price:,.2f}")
+        lines.append(f"  {emoji} Margin: ${margin:+,.2f}/BTC")
+
+    return "\n".join(lines)
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -209,7 +298,12 @@ def log_uptime(workers: list[dict]) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with UPTIME_LOG.open("a") as f:
         for w in workers:
-            f.write(json.dumps({"ts": ts, "worker": w["name"], "online": w["is_online"]}) + "\n")
+            f.write(json.dumps({
+                "ts": ts,
+                "worker": w["name"],
+                "online": w["is_online"],
+                "hashrate_3hr": w["hashrate_3hr"],
+            }) + "\n")
 
 
 def compute_uptime(since: datetime, until: datetime) -> dict:
@@ -236,6 +330,32 @@ def compute_uptime(since: datetime, until: datetime) -> dict:
             except (json.JSONDecodeError, KeyError, ValueError):
                 continue
     return stats
+
+
+def compute_avg_hashrate(since: datetime, until: datetime) -> float:
+    """Read uptime_log.jsonl, return the average combined hashrate (Th/s) across all
+    workers over [since, until], computed as the mean of each poll's worker sum."""
+    if not UPTIME_LOG.exists():
+        return 0.0
+
+    per_poll_sum: dict[str, float] = {}
+    with UPTIME_LOG.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                dt = datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+                if not (since <= dt <= until):
+                    continue
+                per_poll_sum[r["ts"]] = per_poll_sum.get(r["ts"], 0.0) + r.get("hashrate_3hr", 0.0)
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+
+    if not per_poll_sum:
+        return 0.0
+    return sum(per_poll_sum.values()) / len(per_poll_sum)
 
 
 def format_uptime_report(stats: dict, since: datetime, until: datetime) -> str:
@@ -401,7 +521,13 @@ def format_history(events: list[dict]) -> str:
 
 
 def maybe_send_digest(
-    workers: list[dict], state: dict, token: str, chat_id: str, wallet: str | None = None
+    workers: list[dict],
+    state: dict,
+    token: str,
+    chat_id: str,
+    wallet: str | None = None,
+    power_draw_watts: float | None = None,
+    rate_per_kwh: float | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
     now_et = now.astimezone(ZoneInfo("America/New_York"))
@@ -419,6 +545,18 @@ def maybe_send_digest(
         sats = fetch_daily_earnings_sats(wallet)
         if sats is not None:
             lines.append(f"  Estimated daily earnings: {sats:,} sats\n")
+
+    if power_draw_watts is not None and rate_per_kwh is not None:
+        network_stats = fetch_network_stats()
+        if network_stats is not None:
+            avg_hashrate = compute_avg_hashrate(now - timedelta(hours=24), now)
+            breakeven = compute_breakeven(
+                avg_hashrate, network_stats["difficulty"], network_stats["block_reward"],
+                power_draw_watts, rate_per_kwh,
+            )
+            current_price = fetch_btc_price()
+            lines.append(format_breakeven_message(breakeven, avg_hashrate, current_price, "24h avg"))
+            lines.append("")
 
     for worker in sorted(stats):
         s = stats[worker]
@@ -475,7 +613,12 @@ def format_status(workers: list[dict]) -> str:
 
 
 def process_commands(
-    token: str, chat_id: str, workers: list[dict], state: dict
+    token: str,
+    chat_id: str,
+    workers: list[dict],
+    state: dict,
+    power_draw_watts: float | None = None,
+    rate_per_kwh: float | None = None,
 ) -> dict:
     new_state = dict(state)
 
@@ -508,12 +651,36 @@ def process_commands(
             send_telegram(format_uptime_report(stats, since, until), token, chat_id)
         elif text == "/history":
             send_telegram(format_history(get_offline_history(10)), token, chat_id)
+        elif text == "/breakeven":
+            if power_draw_watts is None or rate_per_kwh is None:
+                send_telegram(
+                    "Break-even calc not configured — set POWER_DRAW_WATTS and "
+                    "ELECTRICITY_RATE_PER_KWH in .env",
+                    token,
+                    chat_id,
+                )
+            else:
+                hashrate_ths = sum(w["hashrate_3hr"] for w in workers)
+                network_stats = fetch_network_stats()
+                if network_stats is None:
+                    send_telegram("⚖️ Break-even — Live\n  Network stats unavailable", token, chat_id)
+                else:
+                    breakeven = compute_breakeven(
+                        hashrate_ths, network_stats["difficulty"], network_stats["block_reward"],
+                        power_draw_watts, rate_per_kwh,
+                    )
+                    current_price = fetch_btc_price()
+                    send_telegram(
+                        format_breakeven_message(breakeven, hashrate_ths, current_price, "Live"),
+                        token, chat_id,
+                    )
         elif text == "/help":
             send_telegram(
                 "Available commands:\n"
                 "  /status — current online/offline state of all rigs\n"
                 "  /uptime — 30-day uptime report\n"
                 "  /history — last 10 offline events\n"
+                "  /breakeven — live break-even BTC price\n"
                 "  /help — show this message",
                 token,
                 chat_id,
@@ -575,6 +742,10 @@ def main() -> None:
     wallet = os.getenv("WALLET", "")
     offline_threshold = float(os.getenv("OFFLINE_THRESHOLD_MINUTES", "15"))
     drop_threshold = float(os.getenv("HASHRATE_DROP_THRESHOLD", "0.25"))
+    power_draw_watts = os.getenv("POWER_DRAW_WATTS")
+    power_draw_watts = float(power_draw_watts) if power_draw_watts else None
+    rate_per_kwh = os.getenv("ELECTRICITY_RATE_PER_KWH")
+    rate_per_kwh = float(rate_per_kwh) if rate_per_kwh else None
 
     if not all([token, chat_id, wallet]):
         log.error("Missing required env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, WALLET")
@@ -604,10 +775,16 @@ def main() -> None:
         return
 
     state = load_state()
-    state = process_commands(token, chat_id, workers, state)
+    state = process_commands(
+        token, chat_id, workers, state,
+        power_draw_watts=power_draw_watts, rate_per_kwh=rate_per_kwh,
+    )
     new_state = evaluate_and_alert(workers, state, token, chat_id, offline_threshold)
     new_state = check_outage_reminders(workers, new_state, token, chat_id)
-    new_state = maybe_send_digest(workers, new_state, token, chat_id, wallet=wallet)
+    new_state = maybe_send_digest(
+        workers, new_state, token, chat_id, wallet=wallet,
+        power_draw_watts=power_draw_watts, rate_per_kwh=rate_per_kwh,
+    )
     save_state(new_state)
     log.info("Run complete. State: %s", new_state)
 
