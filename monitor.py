@@ -223,15 +223,26 @@ def fetch_btc_price() -> float | None:
         return None
 
 
-def compute_breakeven(
-    hashrate_ths: float,
-    difficulty: float,
-    block_reward: float,
-    power_draw_watts: float,
-    rate_per_kwh: float,
-) -> dict:
-    """Daily expected BTC, daily electricity cost, and the BTC price needed to break even."""
-    daily_btc = expected_daily_btc(hashrate_ths, difficulty, block_reward)
+def estimate_daily_btc(wallet: str | None, hashrate_ths: float) -> tuple[float | None, str]:
+    """Estimate BTC/day, preferring Ocean's own estimate (already nets out pool fees and
+    tx-fee revenue) and falling back to a theoretical hashrate/difficulty calc if that
+    fetch fails or no wallet is given. Returns (daily_btc, source)."""
+    if wallet:
+        sats = fetch_daily_earnings_sats(wallet)
+        if sats is not None:
+            return sats / 100_000_000, "ocean"
+
+    network_stats = fetch_network_stats()
+    if network_stats is not None:
+        daily_btc = expected_daily_btc(hashrate_ths, network_stats["difficulty"], network_stats["block_reward"])
+        return daily_btc, "theoretical"
+
+    return None, "unavailable"
+
+
+def compute_breakeven(daily_btc: float, power_draw_watts: float, rate_per_kwh: float) -> dict:
+    """Daily electricity cost and the BTC price needed to break even, given an
+    already-estimated daily BTC yield (see estimate_daily_btc)."""
     daily_cost = power_draw_watts / 1000 * 24 * rate_per_kwh
     breakeven_price = daily_cost / daily_btc if daily_btc > 0 else None
     return {
@@ -547,15 +558,13 @@ def maybe_send_digest(
             lines.append(f"  Estimated daily earnings: {sats:,} sats\n")
 
     if power_draw_watts is not None and rate_per_kwh is not None:
-        network_stats = fetch_network_stats()
-        if network_stats is not None:
-            avg_hashrate = compute_avg_hashrate(now - timedelta(hours=24), now)
-            breakeven = compute_breakeven(
-                avg_hashrate, network_stats["difficulty"], network_stats["block_reward"],
-                power_draw_watts, rate_per_kwh,
-            )
+        avg_hashrate = compute_avg_hashrate(now - timedelta(hours=24), now)
+        daily_btc, source = estimate_daily_btc(wallet, avg_hashrate)
+        if daily_btc is not None:
+            breakeven = compute_breakeven(daily_btc, power_draw_watts, rate_per_kwh)
             current_price = fetch_btc_price()
-            lines.append(format_breakeven_message(breakeven, avg_hashrate, current_price, "24h avg"))
+            label = "24h avg" if source == "ocean" else "24h avg (fallback estimate)"
+            lines.append(format_breakeven_message(breakeven, avg_hashrate, current_price, label))
             lines.append("")
 
     for worker in sorted(stats):
@@ -619,6 +628,7 @@ def process_commands(
     state: dict,
     power_draw_watts: float | None = None,
     rate_per_kwh: float | None = None,
+    wallet: str | None = None,
 ) -> dict:
     new_state = dict(state)
 
@@ -661,17 +671,15 @@ def process_commands(
                 )
             else:
                 hashrate_ths = sum(w["hashrate_3hr"] for w in workers)
-                network_stats = fetch_network_stats()
-                if network_stats is None:
-                    send_telegram("⚖️ Break-even — Live\n  Network stats unavailable", token, chat_id)
+                daily_btc, source = estimate_daily_btc(wallet, hashrate_ths)
+                if daily_btc is None:
+                    send_telegram("⚖️ Break-even — Live\n  Daily earnings estimate unavailable", token, chat_id)
                 else:
-                    breakeven = compute_breakeven(
-                        hashrate_ths, network_stats["difficulty"], network_stats["block_reward"],
-                        power_draw_watts, rate_per_kwh,
-                    )
+                    breakeven = compute_breakeven(daily_btc, power_draw_watts, rate_per_kwh)
                     current_price = fetch_btc_price()
+                    label = "Live" if source == "ocean" else "Live (fallback estimate)"
                     send_telegram(
-                        format_breakeven_message(breakeven, hashrate_ths, current_price, "Live"),
+                        format_breakeven_message(breakeven, hashrate_ths, current_price, label),
                         token, chat_id,
                     )
         elif text == "/help":
@@ -777,7 +785,7 @@ def main() -> None:
     state = load_state()
     state = process_commands(
         token, chat_id, workers, state,
-        power_draw_watts=power_draw_watts, rate_per_kwh=rate_per_kwh,
+        power_draw_watts=power_draw_watts, rate_per_kwh=rate_per_kwh, wallet=wallet,
     )
     new_state = evaluate_and_alert(workers, state, token, chat_id, offline_threshold)
     new_state = check_outage_reminders(workers, new_state, token, chat_id)

@@ -620,22 +620,39 @@ class TestMaybeSendDigest:
 
     NETWORK_STATS = {"difficulty": 100_000_000_000_000, "block_height": 963338, "block_reward": 3.125}
 
+    KNOWN_DAILY_BTC = 0.0004086177796125412
+
     def test_digest_includes_breakeven_when_configured(self, tmp_path, monkeypatch):
         log = tmp_path / "uptime_log.jsonl"
         monkeypatch.setattr("monitor.UPTIME_LOG", log)
         with freeze_time("2026-05-17 12:00:00"):
             write_hashrate_records(log, [(datetime.now(timezone.utc), "w1", True, 600.0)])
-            with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+            with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "ocean")):
                 with patch("monitor.fetch_btc_price", return_value=72500.0):
                     with patch("monitor.send_telegram") as mock_send:
                         monitor.maybe_send_digest(
                             FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
-                            self.TOKEN, self.CHAT_ID,
+                            self.TOKEN, self.CHAT_ID, wallet="bc1qtest",
                             power_draw_watts=12300, rate_per_kwh=0.068,
                         )
         result = mock_send.call_args[0][0]
         assert "⚖️" in result
         assert "24h avg" in result
+
+    def test_digest_estimate_called_with_wallet_and_avg_hashrate(self, tmp_path, monkeypatch):
+        log = tmp_path / "uptime_log.jsonl"
+        monkeypatch.setattr("monitor.UPTIME_LOG", log)
+        with freeze_time("2026-05-17 12:00:00"):
+            write_hashrate_records(log, [(datetime.now(timezone.utc), "w1", True, 600.0)])
+            with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "ocean")) as mock_est:
+                with patch("monitor.fetch_btc_price", return_value=72500.0):
+                    with patch("monitor.send_telegram"):
+                        monitor.maybe_send_digest(
+                            FAKE_WORKERS, {"last_digest_date": "2026-05-16"},
+                            self.TOKEN, self.CHAT_ID, wallet="bc1qtest",
+                            power_draw_watts=12300, rate_per_kwh=0.068,
+                        )
+        mock_est.assert_called_once_with("bc1qtest", pytest.approx(600.0))
 
     def test_digest_omits_breakeven_when_not_configured(self, tmp_path, monkeypatch):
         monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
@@ -644,9 +661,9 @@ class TestMaybeSendDigest:
                 monitor.maybe_send_digest(FAKE_WORKERS, {"last_digest_date": "2026-05-16"}, self.TOKEN, self.CHAT_ID)
         assert "⚖️" not in mock_send.call_args[0][0]
 
-    def test_digest_omits_breakeven_when_network_stats_fail(self, tmp_path, monkeypatch):
+    def test_digest_omits_breakeven_when_estimate_unavailable(self, tmp_path, monkeypatch):
         monkeypatch.setattr("monitor.UPTIME_LOG", tmp_path / "uptime_log.jsonl")
-        with patch("monitor.fetch_network_stats", return_value=None):
+        with patch("monitor.estimate_daily_btc", return_value=(None, "unavailable")):
             with patch("monitor.send_telegram") as mock_send:
                 with freeze_time("2026-05-17 12:00:00"):
                     monitor.maybe_send_digest(
@@ -680,7 +697,7 @@ class TestProcessCommandsHelp:
 
 class TestProcessCommandsBreakeven:
     TOKEN, CHAT_ID = "tok", "123"
-    NETWORK_STATS = {"difficulty": 100_000_000_000_000, "block_height": 963338, "block_reward": 3.125}
+    KNOWN_DAILY_BTC = 0.0004086177796125412
 
     def _send_breakeven(self, state=None):
         update = [{"update_id": 1, "message": {"chat": {"id": self.CHAT_ID}, "text": "/breakeven"}}]
@@ -689,7 +706,7 @@ class TestProcessCommandsBreakeven:
             with patch("monitor.send_telegram") as mock_send:
                 monitor.process_commands(
                     self.TOKEN, self.CHAT_ID, FAKE_WORKERS, state,
-                    power_draw_watts=12300, rate_per_kwh=0.068,
+                    power_draw_watts=12300, rate_per_kwh=0.068, wallet="bc1qtest",
                 )
         return mock_send
 
@@ -701,20 +718,32 @@ class TestProcessCommandsBreakeven:
         assert "not configured" in mock_send.call_args[0][0].lower()
 
     def test_success_uses_summed_live_hashrate(self):
-        with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+        with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "ocean")):
             with patch("monitor.fetch_btc_price", return_value=72500.0):
                 mock_send = self._send_breakeven()
         result = mock_send.call_args[0][0]
         assert "975.0" in result  # 650.0 + 325.0 summed across both workers
 
-    def test_network_stats_failure_reports_unavailable(self):
-        with patch("monitor.fetch_network_stats", return_value=None):
+    def test_estimate_called_with_wallet_and_summed_hashrate(self):
+        with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "ocean")) as mock_est:
+            with patch("monitor.fetch_btc_price", return_value=72500.0):
+                self._send_breakeven()
+        mock_est.assert_called_once_with("bc1qtest", 975.0)
+
+    def test_daily_btc_unavailable_reports_unavailable(self):
+        with patch("monitor.estimate_daily_btc", return_value=(None, "unavailable")):
             with patch("monitor.fetch_btc_price", return_value=72500.0):
                 mock_send = self._send_breakeven()
         assert "unavailable" in mock_send.call_args[0][0].lower()
 
+    def test_theoretical_fallback_noted_in_label(self):
+        with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "theoretical")):
+            with patch("monitor.fetch_btc_price", return_value=72500.0):
+                mock_send = self._send_breakeven()
+        assert "fallback" in mock_send.call_args[0][0].lower()
+
     def test_price_failure_still_shows_breakeven(self):
-        with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+        with patch("monitor.estimate_daily_btc", return_value=(self.KNOWN_DAILY_BTC, "ocean")):
             with patch("monitor.fetch_btc_price", return_value=None):
                 mock_send = self._send_breakeven()
         result = mock_send.call_args[0][0]
@@ -838,12 +867,39 @@ class TestFetchBtcPrice:
             assert monitor.fetch_btc_price() is None
 
 
+class TestEstimateDailyBtc:
+    NETWORK_STATS = {"difficulty": 100_000_000_000_000, "block_height": 963338, "block_reward": 3.125}
+
+    def test_ocean_estimate_used_when_available(self):
+        with patch("monitor.fetch_daily_earnings_sats", return_value=45000):
+            result = monitor.estimate_daily_btc("bc1qwallet", hashrate_ths=650)
+        assert result == (pytest.approx(0.00045), "ocean")
+
+    def test_falls_back_to_theoretical_when_ocean_fails(self):
+        with patch("monitor.fetch_daily_earnings_sats", return_value=None):
+            with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+                result = monitor.estimate_daily_btc("bc1qwallet", hashrate_ths=650)
+        assert result[1] == "theoretical"
+        assert result[0] == pytest.approx(0.0004086177796125412)
+
+    def test_returns_none_when_both_fail(self):
+        with patch("monitor.fetch_daily_earnings_sats", return_value=None):
+            with patch("monitor.fetch_network_stats", return_value=None):
+                result = monitor.estimate_daily_btc("bc1qwallet", hashrate_ths=650)
+        assert result == (None, "unavailable")
+
+    def test_skips_ocean_fetch_when_wallet_is_none(self):
+        with patch("monitor.fetch_daily_earnings_sats") as mock_fetch:
+            with patch("monitor.fetch_network_stats", return_value=self.NETWORK_STATS):
+                result = monitor.estimate_daily_btc(None, hashrate_ths=650)
+        mock_fetch.assert_not_called()
+        assert result[1] == "theoretical"
+
+
 class TestComputeBreakeven:
     def test_known_values(self):
         result = monitor.compute_breakeven(
-            hashrate_ths=650,
-            difficulty=100_000_000_000_000,
-            block_reward=3.125,
+            daily_btc=0.0004086177796125412,
             power_draw_watts=12300,
             rate_per_kwh=0.068,
         )
@@ -851,11 +907,9 @@ class TestComputeBreakeven:
         assert result["daily_cost"] == pytest.approx(20.073600000000006)
         assert result["breakeven_price"] == pytest.approx(49125.61567691489)
 
-    def test_zero_hashrate_breakeven_is_none(self):
+    def test_zero_daily_btc_breakeven_is_none(self):
         result = monitor.compute_breakeven(
-            hashrate_ths=0,
-            difficulty=100_000_000_000_000,
-            block_reward=3.125,
+            daily_btc=0.0,
             power_draw_watts=12300,
             rate_per_kwh=0.068,
         )
